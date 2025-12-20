@@ -371,15 +371,17 @@ export class LoadService implements OnModuleInit {
 				completed = true;
 				continue;
 			}
+			// Preserve document IDs before they are mutated by fixIds
+			const documentIds = documents.map((doc) => (doc._id || doc.id).toString());
 			const response = await this.bulkIndexDocuments(config.index_name, documents);
 			await this.extractService.bulkUpdate(
 				config.collection,
-				documents.map((doc) => ({
-					filter: { _id: new ObjectId((doc._id || doc.id) as string) },
+				documentIds.map((id) => ({
+					filter: { _id: new ObjectId(id) },
 					update: {
 						lastIndexedAt: new Date(),
 						lastIndexedResponse: response.items.find(
-							(item) => item.index._id === (doc._id || doc.id).toString(),
+							(item) => item.index._id === id,
 						)?.index?.result,
 					},
 				})),
