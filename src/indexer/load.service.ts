@@ -261,6 +261,15 @@ export class LoadService implements OnModuleInit {
 			index,
 			body: bulkBody,
 		});
+		if (response.errors) {
+			const failures = response.items
+				.map((item: any) => item.index || item.create || item.update || item.delete)
+				.filter((op: any) => op?.error)
+				.slice(0, 5);
+			console.error(
+				`bulkIndexDocuments: ${index} had ${failures.length}+ item-level error(s) (showing up to 5): ${JSON.stringify(failures)}`,
+			);
+		}
 		return response;
 	}
 
