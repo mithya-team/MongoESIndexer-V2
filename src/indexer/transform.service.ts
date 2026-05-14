@@ -18,6 +18,10 @@ export class TransformService {
 	 * 4. Normalizes _id field to id field
 	 * 5. Recursively processes nested objects
 	 *
+	 * NOTE: this still mutates the input doc (deletes _id, replaces ObjectIds
+	 * with their string form in place). Callers must capture any _id they need
+	 * to read BEFORE invoking fixIds (see getBulkIndexBody below).
+	 *
 	 * @param doc - The document or value to process
 	 * @returns The processed document with normalized IDs and string ObjectIds
 	 */
@@ -45,9 +49,11 @@ export class TransformService {
 	 * Transforms an array of MongoDB documents into Elasticsearch bulk index format.
 	 *
 	 * Implementation:
-	 * 1. Processes each document using fixIds to normalize IDs and convert ObjectIds
-	 * 2. Creates Elasticsearch bulk index format with:
-	 *    - Index metadata line containing index name and document ID
+	 * 1. Snapshots each document's _id/id BEFORE fixIds runs (fixIds mutates the
+	 *    input and deletes _id, so reading document._id afterwards is unsafe).
+	 * 2. Processes each document using fixIds to normalize IDs and convert ObjectIds.
+	 * 3. Creates Elasticsearch bulk index format with:
+	 *    - Index metadata line containing index name and the snapshotted document ID
 	 *    - Document data line containing the processed document
 	 *
 	 * @param index - The Elasticsearch index name
@@ -55,12 +61,13 @@ export class TransformService {
 	 * @returns Array of objects in Elasticsearch bulk index format, alternating between metadata and document lines
 	 */
 	async getBulkIndexBody(index: string, documents: any[]) {
+		const ids = documents.map((doc) => (doc?._id ?? doc?.id)?.toString());
 		documents.forEach((doc) => this.fixIds(doc));
-		return documents.flatMap((document) => [
+		return documents.flatMap((document, i) => [
 			{
 				index: {
 					_index: index,
-					_id: document._id || document.id,
+					_id: ids[i],
 				},
 			},
 			document,
