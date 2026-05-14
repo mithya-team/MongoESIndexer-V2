@@ -121,15 +121,25 @@ export class LoadService implements OnModuleInit {
 		await Promise.all(
 			this.configs.map(async (config) => {
 				if (config.index_on_start) {
-					await limiter.schedule(async () => {
-						const bar = multiBar.create(200, 0, {
-							index_name: config.index_name,
-							humanized_eta: 0,
-							total_documents: 0,
-							skipped: 0,
+					try {
+						await limiter.schedule(async () => {
+							const bar = multiBar.create(200, 0, {
+								index_name: config.index_name,
+								humanized_eta: 0,
+								total_documents: 0,
+								skipped: 0,
+							});
+							await this.indexCollection(config, bar);
 						});
-						await this.indexCollection(config, bar);
-					});
+					} catch (err: any) {
+						// Don't let an indexCollection failure prevent the change-stream
+						// supervisor from opening — the cron path can backfill anything
+						// that didn't get picked up during the initial pass, but the
+						// supervisor must be running so real-time events flow.
+						console.error(
+							`indexAll: indexCollection failed for ${config.collection}: ${err?.message || err} — change stream will still be opened`,
+						);
+					}
 				}
 				this.handleChangeStream(config.collection, config.index_name, config.exclude_fields || []).catch(
 					(err) =>
