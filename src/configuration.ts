@@ -25,8 +25,7 @@ export const ConfigurationSchema = z.object({
 		.number()
 		.default(100)
 		.describe(
-			'Number of brand-new documents (no lastESIndexedAt) to process per cron tick. ' +
-				'Was hard-coded to 20.',
+			'Number of brand-new documents (no lastESIndexedAt) to process per cron tick. ' + 'Was hard-coded to 20.',
 		),
 	update_batch_size: z
 		.number()

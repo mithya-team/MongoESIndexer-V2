@@ -169,9 +169,12 @@ export class LoadService implements OnModuleInit {
 					],
 				},
 			},
-			// Secondary sort on _id makes the choice deterministic when multiple
-			// rows share the same `created` millisecond (legacy bloat from before F7).
-			sort: [{ created: 'desc' }, { _id: 'desc' }],
+			// Sort by created desc only. A secondary sort on `_id` was attempted
+			// but ES 7+ disables fielddata on `_id` by default and rejects such
+			// queries with `illegal_argument_exception`. Once F8's cleanup script
+			// runs there is exactly one row per (collection, index) so the
+			// tiebreaker is moot anyway.
+			sort: [{ created: 'desc' }],
 			size: 1,
 		});
 		const token = response.hits.hits[0];
@@ -496,9 +499,7 @@ export class LoadService implements OnModuleInit {
 				// Always pass a mutable holder so acknowledgeChangeEvent can stash a
 				// minted _id back onto it and subsequent acknowledges reuse the same
 				// resume_tokens row (avoids minting a fresh row per event).
-				const resumeToken: { _id?: string } = fetched
-					? { _id: fetched._id as string }
-					: {};
+				const resumeToken: { _id?: string } = fetched ? { _id: fetched._id as string } : {};
 				console.log(
 					`handleChangeStream: ${collectionName} ${index} starting (token: ${token ? 'present' : 'none'})`,
 				);
@@ -515,9 +516,7 @@ export class LoadService implements OnModuleInit {
 					}
 				}
 				// for-await ended without error (stream closed gracefully). Reconnect after backoff.
-				console.warn(
-					`handleChangeStream: ${collectionName} stream ended; reconnecting in ${BACKOFF_MS}ms`,
-				);
+				console.warn(`handleChangeStream: ${collectionName} stream ended; reconnecting in ${BACKOFF_MS}ms`);
 			} catch (streamErr: any) {
 				const message = streamErr?.message || String(streamErr);
 				const isHistoryLost =
@@ -565,9 +564,7 @@ export class LoadService implements OnModuleInit {
 			return;
 		}
 
-		console.log(
-			`handleChangeStream: ${collectionName} ${index} ${change.operationType} ${change.documentKey._id}`,
-		);
+		console.log(`handleChangeStream: ${collectionName} ${index} ${change.operationType} ${change.documentKey._id}`);
 		switch (change.operationType) {
 			case 'insert':
 			case 'update':
@@ -642,9 +639,7 @@ export class LoadService implements OnModuleInit {
 			}
 			console.log(`handleNewDocuments: ${collectionName} ${index} ${documents.length} documents`);
 			const limiter = new Bottleneck({ maxConcurrent: concurrency });
-			await Promise.all(
-				documents.map((doc) => limiter.schedule(() => this.indexOne(collectionName, doc._id))),
-			);
+			await Promise.all(documents.map((doc) => limiter.schedule(() => this.indexOne(collectionName, doc._id))));
 		} catch (error) {
 			console.error(`handleNewDocuments: ${collectionName} ${index} ${error}`);
 			console.error(error);
@@ -691,9 +686,7 @@ export class LoadService implements OnModuleInit {
 			}
 			console.log(`handleUpdatedDocuments: ${collectionName} ${index} ${documents.length} documents`);
 			const limiter = new Bottleneck({ maxConcurrent: concurrency });
-			await Promise.all(
-				documents.map((doc) => limiter.schedule(() => this.indexOne(collectionName, doc._id))),
-			);
+			await Promise.all(documents.map((doc) => limiter.schedule(() => this.indexOne(collectionName, doc._id))));
 		} catch (error) {
 			console.error(`handleUpdatedDocuments: ${collectionName} ${index} ${error}`);
 			console.error(error);

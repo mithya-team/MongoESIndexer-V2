@@ -51,7 +51,10 @@ async function main() {
 				pairs: {
 					composite: {
 						size: 1000,
-						sources: [{ collection: { terms: { field: 'collection' } } }, { index: { terms: { field: 'index' } } }],
+						sources: [
+							{ collection: { terms: { field: 'collection' } } },
+							{ index: { terms: { field: 'index' } } },
+						],
 						...(afterKey ? { after: afterKey } : {}),
 					},
 				},
@@ -70,10 +73,10 @@ async function main() {
 		const keepResp = await client.search({
 			index: INDEX,
 			size: 1,
-			sort: [
-				{ created: 'desc' },
-				{ _id: 'desc' }, // deterministic tiebreaker
-			],
+			// Sort on _id is rejected by ES 7+ (fielddata disabled). Use created
+			// desc only — within same-millisecond ties ES picks one deterministically
+			// per query, which is good enough for this one-off cleanup.
+			sort: [{ created: 'desc' }],
 			query: {
 				bool: {
 					filter: [{ term: { collection: pair.collection } }, { term: { index: pair.index } }],
