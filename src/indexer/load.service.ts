@@ -131,7 +131,12 @@ export class LoadService implements OnModuleInit {
 						await this.indexCollection(config, bar);
 					});
 				}
-				this.handleChangeStream(config.collection, config.index_name, config.exclude_fields || []);
+				this.handleChangeStream(config.collection, config.index_name, config.exclude_fields || []).catch(
+					(err) =>
+						console.error(
+							`handleChangeStream supervisor exited unexpectedly for ${config.collection}: ${err?.message || err}`,
+						),
+				);
 			}),
 		);
 		multiBar.stop();
@@ -454,40 +459,119 @@ export class LoadService implements OnModuleInit {
 	 * @param collectionName - MongoDB collection name
 	 * @param index - Elasticsearch index name
 	 */
+	/**
+	 * Supervises a change-stream consumer for one collection. Reconnects on any
+	 * error, including ChangeStreamHistoryLost (in which case the stale resume
+	 * token is deleted so the next stream starts fresh from "now"). The cron
+	 * fallback (`handleUpdatedDocuments`) covers any inserts/updates that occur
+	 * during the gap; deletes during the gap are not recovered (documented in
+	 * the rollout plan).
+	 */
 	async handleChangeStream(collectionName: string, index: string, excludeFields: string[] = []) {
-		const resumeToken = await this.getResumeToken(collectionName, index);
-		const token = resumeToken?._source?.['token'];
-		console.log(`handleChangeStream: ${collectionName} ${index} token: ${token}`);
-		const changeStream = await this.extractService.getChangeStream(collectionName, token);
+		const BACKOFF_MS = 5000;
+		// Loop forever — graceful shutdown is handled by the process lifecycle (pm2/SIGTERM).
+		for (;;) {
+			let changeStream: Awaited<ReturnType<ExtractService['getChangeStream']>> | undefined;
+			try {
+				const resumeToken = await this.getResumeToken(collectionName, index);
+				const token = resumeToken?._source?.['token'];
+				console.log(
+					`handleChangeStream: ${collectionName} ${index} starting (token: ${token ? 'present' : 'none'})`,
+				);
+				changeStream = await this.extractService.getChangeStream(collectionName, token);
 
-		console.log(`Starting change stream monitoring for ${collectionName}`);
-		for await (const change of changeStream) {
-			// console.log(
-			// 	`handleChangeStream: ${collectionName} ${index} ${change.operationType} ${change.documentKey._id}`,
-			// );
-			const updatedFields = Object.keys(change?.updateDescription?.updatedFields || {});
-			if (hasOnlyIndexingFields(updatedFields, excludeFields) && change.operationType === 'update') {
-				// console.log(`handleChangeStream skip due to only indexing or excluded fields: ${excludeFields}`);
-				await this.acknowledgeChangeEvent(collectionName, index, resumeToken, change);
-				continue;
+				for await (const change of changeStream) {
+					try {
+						await this.processChangeEvent(collectionName, index, excludeFields, change, resumeToken);
+					} catch (eventErr: any) {
+						// Per-event failure must NOT kill the stream.
+						console.error(
+							`handleChangeStream event error (${collectionName} ${change?.operationType} ${change?.documentKey?._id}): ${eventErr?.message || eventErr}`,
+						);
+					}
+				}
+				// for-await ended without error (stream closed gracefully). Reconnect after backoff.
+				console.warn(
+					`handleChangeStream: ${collectionName} stream ended; reconnecting in ${BACKOFF_MS}ms`,
+				);
+			} catch (streamErr: any) {
+				const message = streamErr?.message || String(streamErr);
+				const isHistoryLost =
+					streamErr?.code === 286 || /ChangeStreamHistoryLost|resume of change stream/i.test(message);
+				console.error(`handleChangeStream: ${collectionName} stream crashed: ${message}`);
+				if (isHistoryLost) {
+					console.error(
+						`handleChangeStream: ${collectionName} history lost — discarding stale resume token and restarting from "now"`,
+					);
+					try {
+						await this.discardResumeToken(collectionName, index);
+					} catch (discardErr: any) {
+						console.error(
+							`handleChangeStream: ${collectionName} failed to discard resume token: ${discardErr?.message || discardErr}`,
+						);
+					}
+				}
+			} finally {
+				if (changeStream) {
+					try {
+						await changeStream.close();
+					} catch {
+						/* ignore */
+					}
+				}
 			}
-
-			console.log(
-				`handleChangeStream: ${collectionName} ${index} ${change.operationType} ${change.documentKey._id}`,
-			);
-			switch (change.operationType) {
-				case 'insert':
-					await this.indexOne(collectionName, change.documentKey._id);
-					break;
-				case 'update':
-					await this.indexOne(collectionName, change.documentKey._id);
-					break;
-				case 'delete':
-					await this.deleteOne(collectionName, change.documentKey._id);
-					break;
-			}
-			await this.acknowledgeChangeEvent(collectionName, index, resumeToken, change);
+			await new Promise((r) => setTimeout(r, BACKOFF_MS));
 		}
+	}
+
+	/**
+	 * Processes a single change-stream event. Extracted from handleChangeStream
+	 * so the per-event error handling stays compact.
+	 */
+	private async processChangeEvent(
+		collectionName: string,
+		index: string,
+		excludeFields: string[],
+		change: any,
+		resumeToken: any,
+	) {
+		const updatedFields = Object.keys(change?.updateDescription?.updatedFields || {});
+		if (hasOnlyIndexingFields(updatedFields, excludeFields) && change.operationType === 'update') {
+			await this.acknowledgeChangeEvent(collectionName, index, resumeToken, change);
+			return;
+		}
+
+		console.log(
+			`handleChangeStream: ${collectionName} ${index} ${change.operationType} ${change.documentKey._id}`,
+		);
+		switch (change.operationType) {
+			case 'insert':
+			case 'update':
+				await this.indexOne(collectionName, change.documentKey._id);
+				break;
+			case 'delete':
+				await this.deleteOne(collectionName, change.documentKey._id);
+				break;
+		}
+		await this.acknowledgeChangeEvent(collectionName, index, resumeToken, change);
+	}
+
+	/**
+	 * Deletes all resume_tokens rows for a given (collection, index). Used to
+	 * recover from ChangeStreamHistoryLost — the next stream open will then
+	 * start from "now" rather than trying to resume a position that no longer
+	 * exists in the oplog.
+	 */
+	async discardResumeToken(collectionName: string, index: string) {
+		await this.esClient.deleteByQuery({
+			index: 'resume_tokens',
+			query: {
+				bool: {
+					filter: [{ term: { collection: collectionName } }, { term: { index } }],
+				},
+			},
+			refresh: true,
+		});
 	}
 
 	/**
