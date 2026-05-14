@@ -169,9 +169,9 @@ export class LoadService implements OnModuleInit {
 					],
 				},
 			},
-			sort: {
-				created: 'desc',
-			},
+			// Secondary sort on _id makes the choice deterministic when multiple
+			// rows share the same `created` millisecond (legacy bloat from before F7).
+			sort: [{ created: 'desc' }, { _id: 'desc' }],
 			size: 1,
 		});
 		const token = response.hits.hits[0];
