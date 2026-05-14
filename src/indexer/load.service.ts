@@ -442,15 +442,24 @@ export class LoadService implements OnModuleInit {
 	 * @param newToken - New resume token
 	 */
 	async acknowledgeChangeEvent(collectionName: string, index: string, oldToken: any, newToken: any) {
+		// Stable _id per (collection, index): if oldToken came from getResumeToken
+		// it has a real ES doc _id; otherwise mint one. After the first call we
+		// stash the minted id back onto oldToken so subsequent calls keep writing
+		// to the same row rather than minting a fresh row per event (the cause of
+		// the 3.1M leftover resume_tokens rows accumulated under the old code).
+		const tokenId = oldToken?._id ?? new ObjectId().toString();
 		await this.bulkIndexDocuments('resume_tokens', [
 			{
-				_id: oldToken ? oldToken._id : new ObjectId(),
+				_id: tokenId,
 				token: newToken._id._data,
 				collection: collectionName,
 				index,
 				created: new Date(),
 			},
 		]);
+		if (oldToken && !oldToken._id) {
+			oldToken._id = tokenId;
+		}
 	}
 
 	/**
@@ -482,8 +491,14 @@ export class LoadService implements OnModuleInit {
 		for (;;) {
 			let changeStream: Awaited<ReturnType<ExtractService['getChangeStream']>> | undefined;
 			try {
-				const resumeToken = await this.getResumeToken(collectionName, index);
-				const token = resumeToken?._source?.['token'];
+				const fetched = await this.getResumeToken(collectionName, index);
+				const token = fetched?._source?.['token'];
+				// Always pass a mutable holder so acknowledgeChangeEvent can stash a
+				// minted _id back onto it and subsequent acknowledges reuse the same
+				// resume_tokens row (avoids minting a fresh row per event).
+				const resumeToken: { _id?: string } = fetched
+					? { _id: fetched._id as string }
+					: {};
 				console.log(
 					`handleChangeStream: ${collectionName} ${index} starting (token: ${token ? 'present' : 'none'})`,
 				);
