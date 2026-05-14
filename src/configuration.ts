@@ -21,6 +21,27 @@ export const ConfigurationSchema = z.object({
 	}),
 	update_field: z.string().optional().describe('The date field to use for updated documents'),
 	exclude_fields: z.array(z.string()).optional().describe('The fields to exclude from indexing'),
+	new_batch_size: z
+		.number()
+		.default(100)
+		.describe(
+			'Number of brand-new documents (no lastESIndexedAt) to process per cron tick. ' +
+				'Was hard-coded to 20.',
+		),
+	update_batch_size: z
+		.number()
+		.default(500)
+		.describe(
+			'Number of stale documents (updated >= lastESIndexedAt) to process per cron tick. ' +
+				'Was hard-coded to 50.',
+		),
+	index_concurrency: z
+		.number()
+		.default(20)
+		.describe(
+			'Maximum concurrent indexOne() calls per cron tick. Caps fan-out into Mongo aggregation ' +
+				'and ES bulk pipelines so larger batch sizes do not overwhelm downstream services.',
+		),
 });
 
 export type Configuration = z.infer<typeof ConfigurationSchema>;

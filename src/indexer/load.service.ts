@@ -592,6 +592,9 @@ export class LoadService implements OnModuleInit {
 	 */
 
 	async handleNewDocuments(collectionName: string, index: string) {
+		const config = this.configs.find((c) => c.collection === collectionName);
+		const batchSize = config?.new_batch_size ?? 100;
+		const concurrency = config?.index_concurrency ?? 20;
 		console.log(`handleNewDocuments: ${collectionName} ${index}`);
 		try {
 			const documents = await this.extractService.getDocuments(
@@ -607,20 +610,26 @@ export class LoadService implements OnModuleInit {
 							_id: 1,
 						},
 					},
+					// Newest-first: brand-new docs are the most likely to be user-visible
+					// (someone just created them), so they index ahead of any old unindexed
+					// stragglers that have been waiting around.
 					{
 						$sort: {
-							_id: 1,
+							_id: -1,
 						},
 					},
 				],
-				20,
+				batchSize,
 			);
 			if (documents.length === 0) {
 				console.log(`handleNewDocuments: ${collectionName} ${index} no documents to index`);
 				return;
 			}
 			console.log(`handleNewDocuments: ${collectionName} ${index} ${documents.length} documents`);
-			await Promise.all(documents.map((doc) => this.indexOne(collectionName, doc._id)));
+			const limiter = new Bottleneck({ maxConcurrent: concurrency });
+			await Promise.all(
+				documents.map((doc) => limiter.schedule(() => this.indexOne(collectionName, doc._id))),
+			);
 		} catch (error) {
 			console.error(`handleNewDocuments: ${collectionName} ${index} ${error}`);
 			console.error(error);
@@ -628,6 +637,9 @@ export class LoadService implements OnModuleInit {
 	}
 
 	async handleUpdatedDocuments(collectionName: string, index: string, updateField: string = 'updated') {
+		const config = this.configs.find((c) => c.collection === collectionName);
+		const batchSize = config?.update_batch_size ?? 500;
+		const concurrency = config?.index_concurrency ?? 20;
 		console.log(`handleUpdatedDocuments: ${collectionName} ${index}`);
 		try {
 			const documents = await this.extractService.getDocuments(
@@ -645,20 +657,28 @@ export class LoadService implements OnModuleInit {
 							_id: 1,
 						},
 					},
+					// FIFO over staleness: oldest stale first. The previous sort by _id
+					// ASC caused newest-doc starvation — a re-bumped 2019 doc (small _id)
+					// would jump in front of a freshly-published 2026 doc (large _id).
+					// Sorting by the update field instead makes queue position depend on
+					// when the doc became stale, not when it was originally created.
 					{
 						$sort: {
-							_id: 1,
+							[updateField]: 1,
 						},
 					},
 				],
-				50,
+				batchSize,
 			);
 			if (documents.length === 0) {
 				console.log(`handleUpdatedDocuments: ${collectionName} ${index} no documents to index`);
 				return;
 			}
 			console.log(`handleUpdatedDocuments: ${collectionName} ${index} ${documents.length} documents`);
-			await Promise.all(documents.map((doc) => this.indexOne(collectionName, doc._id)));
+			const limiter = new Bottleneck({ maxConcurrent: concurrency });
+			await Promise.all(
+				documents.map((doc) => limiter.schedule(() => this.indexOne(collectionName, doc._id))),
+			);
 		} catch (error) {
 			console.error(`handleUpdatedDocuments: ${collectionName} ${index} ${error}`);
 			console.error(error);
