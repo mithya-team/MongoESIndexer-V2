@@ -287,6 +287,67 @@ export class LoadService implements OnModuleInit {
 	}
 
 	/**
+	 * Indexes many documents into Elasticsearch in one round-trip per ES index.
+	 * Mirrors indexOne's logic but uses one $in match + one bulk ES call + one
+	 * Mongo bulkUpdate, which is ~50x faster than calling indexOne N times
+	 * (saves N-1 Mongo aggregations and N-1 ES bulk-of-1 calls).
+	 *
+	 * Throws on any per-index failure so the caller can decide to fall back
+	 * to per-doc processing for the affected batch.
+	 *
+	 * @param collection - MongoDB collection name
+	 * @param ids - Document IDs to index
+	 */
+	async indexMany(collection: string, ids: string[]) {
+		if (!ids || ids.length === 0) return;
+		const configs = this.configs.filter((config) => config.collection === collection);
+		if (configs.length === 0) {
+			throw new Error(`indexMany: config for ${collection} not found`);
+		}
+		const objectIds = ids.map((id) => new ObjectId(id));
+		for (const config of configs) {
+			const { pipeline, separateLookups } = this.extractService.processSeparateLookups(
+				config.aggregation_pipeline,
+			);
+			const documents = await this.extractService.getDocumentsWithNestedPagination(
+				config.collection,
+				[
+					{
+						$match: { _id: { $in: objectIds } },
+					},
+					...pipeline,
+				],
+				separateLookups.map((index) => index + 1),
+			);
+			if (documents.length === 0) {
+				console.log(`indexMany: ${collection} ${config.index_name} no documents found for batch of ${ids.length}`);
+				continue;
+			}
+			const response = await this.bulkIndexDocuments(config.index_name, documents);
+
+			// Build _id -> result map from the bulk response so each doc gets the
+			// right lastESIndexResponse stamped onto it.
+			const resultMap = new Map<string, string>();
+			for (const item of response.items || []) {
+				const responseId = item.index?._id;
+				if (responseId) resultMap.set(responseId, item.index?.result || 'unknown');
+			}
+
+			const now = new Date();
+			await this.extractService.bulkUpdate(
+				collection,
+				documents.map((doc: any) => ({
+					filter: { _id: doc._id },
+					update: {
+						lastESIndexedAt: now,
+						lastESIndexResponse: resultMap.get(doc._id.toString()) || 'unknown',
+					},
+				})),
+			);
+		}
+	}
+
+	/**
 	 * Indexes a single document from MongoDB to Elasticsearch.
 	 * Updates the document's lastESIndexedAt timestamp in MongoDB.
 	 *
@@ -500,6 +561,13 @@ export class LoadService implements OnModuleInit {
 	 */
 	async handleChangeStream(collectionName: string, index: string, excludeFields: string[] = []) {
 		const BACKOFF_MS = 5000;
+		// Batching: accumulate up to BATCH_SIZE events or flush after BATCH_FLUSH_MS,
+		// whichever comes first. The serial-per-event path bottlenecked at ~3 docs/s
+		// because each event ran its own Mongo aggregation + ES bulk-of-1 call; batching
+		// brings this to ~100+ docs/s by coalescing many events into one round-trip.
+		// Override via env vars CHANGESTREAM_BATCH_SIZE and CHANGESTREAM_BATCH_FLUSH_MS.
+		const BATCH_SIZE = Math.max(1, parseInt(process.env.CHANGESTREAM_BATCH_SIZE || '100', 10));
+		const BATCH_FLUSH_MS = Math.max(50, parseInt(process.env.CHANGESTREAM_BATCH_FLUSH_MS || '500', 10));
 		// Loop forever — graceful shutdown is handled by the process lifecycle (pm2/SIGTERM).
 		for (;;) {
 			let changeStream: Awaited<ReturnType<ExtractService['getChangeStream']>> | undefined;
@@ -511,21 +579,61 @@ export class LoadService implements OnModuleInit {
 				// resume_tokens row (avoids minting a fresh row per event).
 				const resumeToken: { _id?: string } = fetched ? { _id: fetched._id as string } : {};
 				console.log(
-					`handleChangeStream: ${collectionName} ${index} starting (token: ${token ? 'present' : 'none'})`,
+					`handleChangeStream: ${collectionName} ${index} starting (token: ${token ? 'present' : 'none'}, batch: ${BATCH_SIZE}/${BATCH_FLUSH_MS}ms)`,
 				);
 				changeStream = await this.extractService.getChangeStream(collectionName, token);
 
-				for await (const change of changeStream) {
+				const buffer: any[] = [];
+				let flushTimer: NodeJS.Timeout | null = null;
+				let flushInFlight: Promise<void> = Promise.resolve();
+
+				const flushBuffer = async () => {
+					if (flushTimer) {
+						clearTimeout(flushTimer);
+						flushTimer = null;
+					}
+					if (buffer.length === 0) return;
+					const events = buffer.splice(0);
 					try {
-						await this.processChangeEvent(collectionName, index, excludeFields, change, resumeToken);
-					} catch (eventErr: any) {
-						// Per-event failure must NOT kill the stream.
+						await this.processBatchedChangeEvents(collectionName, index, excludeFields, events, resumeToken);
+					} catch (batchErr: any) {
+						// Batch-level failure: fall back to per-event processing so any
+						// one bad event doesn't poison the rest.
 						console.error(
-							`handleChangeStream event error (${collectionName} ${change?.operationType} ${change?.documentKey?._id}): ${eventErr?.message || eventErr}`,
+							`handleChangeStream batch error (${collectionName}, ${events.length} events): ${batchErr?.message || batchErr} — falling back to per-event`,
 						);
+						for (const ev of events) {
+							try {
+								await this.processChangeEvent(collectionName, index, excludeFields, ev, resumeToken);
+							} catch (eventErr: any) {
+								console.error(
+									`handleChangeStream event error (${collectionName} ${ev?.operationType} ${ev?.documentKey?._id}): ${eventErr?.message || eventErr}`,
+								);
+							}
+						}
+					}
+				};
+
+				for await (const change of changeStream) {
+					buffer.push(change);
+					if (buffer.length >= BATCH_SIZE) {
+						// Size-trigger flush: await current in-flight then flush this batch.
+						await flushInFlight;
+						flushInFlight = flushBuffer();
+						await flushInFlight;
+					} else if (!flushTimer) {
+						// Time-trigger flush: arm a one-shot timer; cleared on the next size-flush.
+						flushTimer = setTimeout(() => {
+							flushTimer = null;
+							flushInFlight = flushInFlight.then(() => flushBuffer()).catch((e) => {
+								console.error(`handleChangeStream timer-flush failed: ${e?.message || e}`);
+							});
+						}, BATCH_FLUSH_MS);
 					}
 				}
-				// for-await ended without error (stream closed gracefully). Reconnect after backoff.
+				// Stream ended gracefully — drain whatever's left so we don't lose events.
+				await flushInFlight;
+				await flushBuffer();
 				console.warn(`handleChangeStream: ${collectionName} stream ended; reconnecting in ${BACKOFF_MS}ms`);
 			} catch (streamErr: any) {
 				const message = streamErr?.message || String(streamErr);
@@ -585,6 +693,72 @@ export class LoadService implements OnModuleInit {
 				break;
 		}
 		await this.acknowledgeChangeEvent(collectionName, index, resumeToken, change);
+	}
+
+	/**
+	 * Processes a batch of change-stream events. Coalesces inserts+updates into
+	 * one indexMany call and per-delete deletes, then acknowledges the last
+	 * event's resume token (the stream is ordered, so the last token covers all
+	 * events in the batch).
+	 *
+	 * Throws on batch-level failure so the caller can fall back to per-event.
+	 */
+	private async processBatchedChangeEvents(
+		collectionName: string,
+		index: string,
+		excludeFields: string[],
+		events: any[],
+		resumeToken: any,
+	) {
+		if (events.length === 0) return;
+		const indexIds = new Set<string>();
+		const deleteIds: string[] = [];
+		let skippedCount = 0;
+		for (const change of events) {
+			const updatedFields = Object.keys(change?.updateDescription?.updatedFields || {});
+			const docId = change.documentKey?._id?.toString?.();
+			if (!docId) continue;
+			if (hasOnlyIndexingFields(updatedFields, excludeFields) && change.operationType === 'update') {
+				// Only indexing fields changed — no re-index needed, just ack the token at end.
+				skippedCount++;
+				continue;
+			}
+			switch (change.operationType) {
+				case 'delete':
+					deleteIds.push(docId);
+					// If we also had an index intent for this id earlier in the batch, drop it.
+					indexIds.delete(docId);
+					break;
+				case 'insert':
+				case 'update':
+					indexIds.add(docId);
+					break;
+			}
+		}
+
+		console.log(
+			`handleChangeStream: ${collectionName} ${index} batch=${events.length} index=${indexIds.size} delete=${deleteIds.length} skipped=${skippedCount}`,
+		);
+
+		if (indexIds.size > 0) {
+			await this.indexMany(collectionName, Array.from(indexIds));
+		}
+		for (const id of deleteIds) {
+			try {
+				await this.deleteOne(collectionName, id);
+			} catch (deleteErr: any) {
+				console.error(
+					`handleChangeStream delete error (${collectionName} ${id}): ${deleteErr?.message || deleteErr}`,
+				);
+			}
+		}
+		// Acknowledge with the last event's token — change-stream is ordered, so this
+		// covers every event in the batch. On crash mid-batch, the stream resumes at
+		// the last ack'd point and re-processes from there (idempotent).
+		const lastEvent = events[events.length - 1];
+		if (lastEvent) {
+			await this.acknowledgeChangeEvent(collectionName, index, resumeToken, lastEvent);
+		}
 	}
 
 	/**
