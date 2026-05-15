@@ -320,9 +320,17 @@ export class LoadService implements OnModuleInit {
 				separateLookups.map((index) => index + 1),
 			);
 			if (documents.length === 0) {
-				console.log(`indexMany: ${collection} ${config.index_name} no documents found for batch of ${ids.length}`);
+				console.log(
+					`indexMany: ${collection} ${config.index_name} no documents found for batch of ${ids.length}`,
+				);
 				continue;
 			}
+			// Snapshot _id BEFORE bulkIndexDocuments — it calls transformService.fixIds
+			// which mutates each document and renames _id to id. Without this snapshot
+			// the post-call code below hits "Cannot read properties of undefined
+			// (reading 'toString')" when trying to use doc._id.
+			const docIds: any[] = documents.map((d: any) => d._id ?? d.id);
+			const docIdStrings: string[] = docIds.map((id) => id?.toString());
 			const response = await this.bulkIndexDocuments(config.index_name, documents);
 
 			// Build _id -> result map from the bulk response so each doc gets the
@@ -336,11 +344,11 @@ export class LoadService implements OnModuleInit {
 			const now = new Date();
 			await this.extractService.bulkUpdate(
 				collection,
-				documents.map((doc: any) => ({
-					filter: { _id: doc._id },
+				docIds.map((id, i) => ({
+					filter: { _id: id },
 					update: {
 						lastESIndexedAt: now,
-						lastESIndexResponse: resultMap.get(doc._id.toString()) || 'unknown',
+						lastESIndexResponse: resultMap.get(docIdStrings[i]) || 'unknown',
 					},
 				})),
 			);
@@ -595,7 +603,13 @@ export class LoadService implements OnModuleInit {
 					if (buffer.length === 0) return;
 					const events = buffer.splice(0);
 					try {
-						await this.processBatchedChangeEvents(collectionName, index, excludeFields, events, resumeToken);
+						await this.processBatchedChangeEvents(
+							collectionName,
+							index,
+							excludeFields,
+							events,
+							resumeToken,
+						);
 					} catch (batchErr: any) {
 						// Batch-level failure: fall back to per-event processing so any
 						// one bad event doesn't poison the rest.
@@ -625,9 +639,11 @@ export class LoadService implements OnModuleInit {
 						// Time-trigger flush: arm a one-shot timer; cleared on the next size-flush.
 						flushTimer = setTimeout(() => {
 							flushTimer = null;
-							flushInFlight = flushInFlight.then(() => flushBuffer()).catch((e) => {
-								console.error(`handleChangeStream timer-flush failed: ${e?.message || e}`);
-							});
+							flushInFlight = flushInFlight
+								.then(() => flushBuffer())
+								.catch((e) => {
+									console.error(`handleChangeStream timer-flush failed: ${e?.message || e}`);
+								});
 						}, BATCH_FLUSH_MS);
 					}
 				}
