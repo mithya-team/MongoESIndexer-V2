@@ -235,7 +235,8 @@
                 "parentIds": 1,
                 "cldDocs": 1,
                 "isAnalysed": 1,
-                "decisionHasLf": 1
+                "decisionHasLf": 1,
+                "lexsitusReferences": 1
             }
         }
     ],
@@ -869,6 +870,10 @@
                             "type": "boolean"
                         }
                     }
+                },
+                "lexsitusReferences": {
+                    "type": "object",
+                    "enabled": false
                 },
                 "cldDocs.id": {
                     "type": "text",
