@@ -235,7 +235,23 @@
                 "parentIds": 1,
                 "cldDocs": 1,
                 "isAnalysed": 1,
-                "decisionHasLf": 1
+                "decisionHasLf": 1,
+                "hasLexsitusReferences": {
+                    "$cond": [
+                        {
+                            "$isArray": "$lexsitusReferences"
+                        },
+                        {
+                            "$gt": [
+                                {
+                                    "$size": "$lexsitusReferences"
+                                },
+                                0
+                            ]
+                        },
+                        false
+                    ]
+                }
             }
         }
     ],
@@ -869,6 +885,9 @@
                             "type": "boolean"
                         }
                     }
+                },
+                "hasLexsitusReferences": {
+                    "type": "boolean"
                 },
                 "cldDocs.id": {
                     "type": "text",
