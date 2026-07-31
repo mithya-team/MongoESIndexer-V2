@@ -236,7 +236,22 @@
                 "cldDocs": 1,
                 "isAnalysed": 1,
                 "decisionHasLf": 1,
-                "lexsitusReferences": 1
+                "hasLexsitusReferences": {
+                    "$cond": [
+                        {
+                            "$isArray": "$lexsitusReferences"
+                        },
+                        {
+                            "$gt": [
+                                {
+                                    "$size": "$lexsitusReferences"
+                                },
+                                0
+                            ]
+                        },
+                        false
+                    ]
+                }
             }
         }
     ],
@@ -871,9 +886,8 @@
                         }
                     }
                 },
-                "lexsitusReferences": {
-                    "type": "object",
-                    "enabled": false
+                "hasLexsitusReferences": {
+                    "type": "boolean"
                 },
                 "cldDocs.id": {
                     "type": "text",
